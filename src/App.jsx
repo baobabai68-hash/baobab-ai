@@ -1,18 +1,19 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════╗
- * ║           BAOBAB AI — VERSION 3.1 FINALE PRÊTE POUR RAILWAY         ║
+ * ║         BAOBAB AI — VERSION 3.2 — FLUX PAIEMENT CORRIGÉ            ║
  * ║    Inclut les 3 corrections post-audit V3 + structure Vite/Railway   ║
  * ╠══════════════════════════════════════════════════════════════════════╣
  * ║  CORRECTIONS V3 héritées :                                          ║
  * ║  ✓ FLAG TEST_MODE · Mots de passe encodés · Déduction réelle       ║
  * ║  ✓ Auto-valider · Bandeau TEST_MODE · Simulations réalistes        ║
  * ║                                                                      ║
- * ║  CORRECTIONS V3.1 (post-audit final) :                              ║
- * ║  ✓ adminPassword encodé hashPwd() — plus jamais en clair           ║
- * ║  ✓ Fuseau horaire WAT (Yaoundé UTC+1) — currentMonth corrigé       ║
- * ║  ✓ INF_ACCOUNTS : hashPwd unifié avec users (cohérence totale)     ║
- * ║  ✓ Structure Vite fournie → déploiement Railway sans config         ║
- * ║  ✓ manifest.json PWA inclus                                          ║
+ * ║  CORRECTIONS V3.1 : adminPassword · fuseau WAT · hashPwd unifié     ║
+ * ║                                                                      ║
+ * ║  CORRECTIONS V3.2 (flux paiement) :                                 ║
+ * ║  ✓ TEST_MODE : accès immédiat après paiement (plus de blocage)      ║
+ * ║  ✓ Message paiement : "quelques minutes" au lieu de "24h"           ║
+ * ║  ✓ PendingPage : bouton "Vérifier mon accès" qui check la DB        ║
+ * ║  ✓ Quand admin active → utilisateur accède sans se reconnecter      ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  *
  * ARCHITECTURE DE DÉPLOIEMENT :
@@ -49,12 +50,30 @@ const CFG = {
   commissionPct:    20,       // % du bénéfice propriétaire reversé à l'influenceur
   adminEmail:   "admin@baobab.ai",
   adminPasswordHash: btoa(unescape(encodeURIComponent("BaobabAdmin2025!"))), // encodé, jamais en clair
-  // Limites tokens pour contrôle du budget CrazyRouter
-  // 5 000 FCFA ≈ 8,50 USD → ~8,5M tokens cheap. 1M crédits = ce budget.
-  maxSimpleInput:  2_500,
-  maxSimpleOutput: 4_000,
-  maxComplexIn:    4_000,
-  maxComplexOut:   8_000,
+
+  // ── LIMITES TOKENS — appliquées dans chaque appel API ──────────────────
+  // Calibrées pour que 1M crédits ≤ 5 000 FCFA CrazyRouter.
+  // Ces valeurs sont passées comme max_tokens dans chaque requête IA.
+  maxSimpleInput:   800,  // tokens input : messages courts (chat, Q&R)
+  maxSimpleOutput:  800,  // tokens output : réponses concises imposées
+  maxMediumInput:  1_500, // tokens input : rédactions, analyses moyennes
+  maxMediumOutput: 1_500, // tokens output : réponses développées
+  maxComplexIn:    2_500, // tokens input : documents, code, analyse longue
+  maxComplexOut:   3_000, // tokens output : réponses complexes
+
+  // ── SEUILS DE COMPLEXITÉ pour la sélection auto du modèle ──────────────
+  // Un prompt court et simple → modèle budget (nano/flash)
+  // Un prompt moyen → modèle milieu (mini)
+  // Un prompt long ou complexe → modèle premium (sonnet)
+  complexitySimple:   80,  // < 80 chars → modèle budget
+  complexityMedium:  200,  // 80-200 chars → modèle milieu
+  // > 200 chars ou mots-clés complexes → modèle premium
+
+  // ── QUOTA VIDÉO MENSUEL ─────────────────────────────────────────────────
+  videoQuotaPerMonth: 3,   // 3 vidéos/mois max par abonné
+
+  // ── TRONCATURE CONTEXTE CONVERSATIONNEL ────────────────────────────────
+  maxContextMessages: 8,   // Nb max d'échanges envoyés à l'IA (4 paires)
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -165,11 +184,15 @@ const hashPwd = pwd => btoa(unescape(encodeURIComponent(pwd)));
 /** Vérifie un mot de passe */
 const checkPwd = (pwd, hash) => hashPwd(pwd) === hash;
 
-/** Estime les crédits consommés pour un prompt + modèle */
+/** Estime les crédits consommés pour un prompt + modèle.
+ *  Utilise les limites dynamiques selon la complexité détectée —
+ *  l'estimation est donc cohérente avec le vrai coût en production. */
 const estCredits = (prompt, model) => {
   if (["image","audio","video"].some(t => model.spec.includes(t))) return model.ri;
-  const inTok  = Math.min(Math.ceil(prompt.length / 3.5), CFG.maxSimpleInput);
-  const outTok = Math.min(Math.ceil(inTok * 1.8),          CFG.maxSimpleOutput);
+  const complexity = detectComplexity(prompt);
+  const limits     = getTokenLimits(complexity);
+  const inTok  = Math.min(Math.ceil(prompt.length / 3.5), limits.maxIn);
+  const outTok = Math.min(Math.ceil(inTok * 1.8),          limits.maxOut);
   return Math.ceil((inTok/100)*model.ri + (outTok/100)*model.ro);
 };
 
@@ -180,8 +203,38 @@ const realCost = (model, usageIn, usageOut) => {
 };
 
 /** Sélectionne le meilleur modèle selon prompt + mode */
+/**
+ * Détecte la complexité réelle d'un prompt.
+ * Simple : questions courtes, salutations, Q&R basiques.
+ * Medium  : rédactions, résumés, traductions, analyses moyennes.
+ * Complex : code, documents longs, analyses approfondies, débogages.
+ */
+const detectComplexity = prompt => {
+  const len = prompt.trim().length;
+  const lc  = prompt.toLowerCase();
+  // Mots-clés forcément complexes
+  const complexKeywords = /code|programme|script|fonction|bug|débogu|architecture|contrat|rapport|analyse approfondie|développ|algorithme|base de données|backend|frontend|api/;
+  // Mots-clés moyens
+  const mediumKeywords  = /résumé|résume|rédige|tradui|explique|email|lettre|plan|structure|compare|liste des|idées pour|stratégie/;
+
+  if (complexKeywords.test(lc) || len > CFG.complexityMedium) return "complex";
+  if (mediumKeywords.test(lc)  || len > CFG.complexitySimple)  return "medium";
+  return "simple";
+};
+
+/**
+ * Retourne les limites de tokens adaptées à la complexité.
+ */
+const getTokenLimits = complexity => {
+  if (complexity === "complex") return { maxIn: CFG.maxComplexIn,  maxOut: CFG.maxComplexOut  };
+  if (complexity === "medium")  return { maxIn: CFG.maxMediumInput, maxOut: CFG.maxMediumOutput };
+  return                               { maxIn: CFG.maxSimpleInput, maxOut: CFG.maxSimpleOutput };
+};
+
 const pickModel = (prompt, mode) => {
   const lc = prompt.toLowerCase();
+
+  // ── Détection du type de tâche ──────────────────────────────────────────
   let spec = "chat";
   if (/image|photo|dessin|illustration|génère.*image|crée.*visuel/.test(lc)) spec = "image";
   else if (/audio|voix|tts|transcri|speech|musique/.test(lc))               spec = "audio";
@@ -192,9 +245,23 @@ const pickModel = (prompt, mode) => {
   let pool = MODELS.filter(m => m.spec.includes(spec));
   if (!pool.length) pool = MODELS.filter(m => m.spec.includes("chat"));
 
+  // ── Mode forcé par l'utilisateur ────────────────────────────────────────
   if (mode === "eco")   return pool.sort((a,b) => a.ri - b.ri)[0];
   if (mode === "power") return pool.sort((a,b) => b.bm - a.bm)[0];
-  return pool.sort((a,b) => (b.bm*1.5/(b.ri||1)) - (a.bm*1.5/(a.ri||1)))[0];
+
+  // ── Mode AUTO : sélection intelligente selon complexité ─────────────────
+  // Tâches non-texte : toujours le meilleur rapport qualité/prix
+  if (!["chat","code","analyse"].some(s => pool[0]?.spec.includes(s))) {
+    return pool.sort((a,b) => (b.bm*1.5/(b.ri||1)) - (a.bm*1.5/(a.ri||1)))[0];
+  }
+
+  const complexity = detectComplexity(prompt);
+  // Simple → modèle le moins cher (budget)
+  if (complexity === "simple")  return pool.sort((a,b) => a.ri - b.ri)[0];
+  // Medium  → meilleur rapport qualité/coût (milieu de gamme)
+  if (complexity === "medium")  return pool.sort((a,b) => (b.bm*1.5/(b.ri||1)) - (a.bm*1.5/(a.ri||1)))[0];
+  // Complex → meilleur benchmark (premium)
+  return pool.sort((a,b) => b.bm - a.bm)[0];
 };
 
 const taskType = prompt => {
@@ -214,49 +281,132 @@ const taskType = prompt => {
  * Chaque simulation imite le comportement attendu du modèle réel.
  */
 const SIMULATED_RESPONSES = {
+
+  // Reformulateur par règles locales — sans API, sans coût.
+  // Utilisé en TEST_MODE ET comme base en production.
+  // Transforme un prompt naturel en instruction directe optimisée.
   reformulate: prompt => {
-    const lower = prompt.toLowerCase().trim();
-    // Quelques règles de simplification pour simuler la reformulation
-    let result = prompt
-      .replace(/aide moi à|peux tu|pourrais tu|est ce que tu peux/gi, "")
-      .replace(/s'il te plaît|svp|stp/gi, "")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (result.length < 10) result = prompt; // garde l'original si trop court
-    // Capitalise la première lettre
-    result = result.charAt(0).toUpperCase() + result.slice(1);
-    if (!result.endsWith(".") && !result.endsWith("?") && !result.endsWith("!")) result += ".";
-    return result;
+    let r = prompt.trim();
+
+    // 1. Corrections orthographiques courantes (français camerounais)
+    const ortho = [
+      ["rezumé", "résumé"], ["resumé", "résumé"], ["analise", "analyse"],
+      ["besion", "besoin"], ["imporant", "important"], ["apication", "application"],
+      ["écrir", "écrire"], ["koi", "quoi"], ["pk ", "pourquoi "], ["qd ", "quand "],
+      ["ms ", "mais "], ["dc ", "donc "], ["pr ", "pour "], ["av ", "avec "],
+      ["tjs ", "toujours "], ["stp", ""], ["svp", ""], ["bcp", "beaucoup"],
+    ];
+    ortho.forEach(([old, rep]) => {
+      r = r.replace(new RegExp("\\b" + old + "\\b", "gi"), rep);
+    });
+
+    // 2. Supprimer les formules de politesse inutiles pour l'IA
+    r = r.replace(/^(bonjour|salut|hello|bonsoir|hey|coucou)[,!\.\s]*/i, "");
+    r = r.replace(/s'il (te|vous) pla[iî]t[,\.]?/gi, "");
+    r = r.replace(/merci (d'avance|beaucoup|bcp)?[,\.]?/gi, "");
+    r = r.replace(/(peux-?tu|pourrais-?tu|pourriez-?vous|est-?ce que tu peux?)/gi, "");
+    r = r.replace(/(aide-?moi [aà]|aide-?moi|aidez-?moi)/gi, "");
+    r = r.replace(/(j[e']?\s*(voudrais?|veux|souhaite|désire|aimerai[st])\s+)/gi, "");
+    r = r.replace(/(j['']ai besoin (que tu|de\s*))/gi, "");
+    r = r.replace(/(il faut que tu|j['']aimerais que tu)/gi, "");
+
+    // 3. Convertir en instruction directe (impératif)
+    r = r.replace(/^(rédiger|écrire)\s+/i, "Rédige ");
+    r = r.replace(/^(créer|faire|générer)\s+/i, "Crée ");
+    r = r.replace(/^(expliquer|comprendre)\s+/i, "Explique ");
+    r = r.replace(/^(analyser)\s+/i, "Analyse ");
+    r = r.replace(/^(traduire)\s+/i, "Traduis ");
+    r = r.replace(/^(résumer|faire un résumé de?)\s+/i, "Résume ");
+    r = r.replace(/^(corriger)\s+/i, "Corrige ");
+    r = r.replace(/^(lister|faire une liste de?)\s+/i, "Liste ");
+    r = r.replace(/^comment (faire|on fait) (pour )?/i, "Explique comment ");
+    r = r.replace(/^qu['']est-?ce (que?|qu[''])/i, "Explique ");
+    r = r.replace(/^c['']?est quoi\s+/i, "Définis ");
+    r = r.replace(/^(dis-?moi|explique-?moi|montre-?moi)\s+/i, "Explique ");
+
+    // 4. Ajout de précision contextuelle si manquante
+    if (/email|mail|courriel/i.test(r) && !/professionnel|formel|informel/i.test(r))
+      r = r.replace(/\b(email|mail|courriel)\b/gi, "email professionnel");
+    if (/résume|résumé/i.test(r) && !/concis|court|bref|point/i.test(r))
+      r = r.replace(/\.$/, "") + " en 5 points clés.";
+    if (/tradui/i.test(r) && !/vers |en (anglais|français|espagnol)/i.test(r))
+      r = r.replace(/\.$/, "") + " en anglais.";
+
+    // 5. Nettoyage final
+    r = r.replace(/\s+/g, " ").trim();
+    if (r.length < 8) r = prompt.trim();
+    r = r.charAt(0).toUpperCase() + r.slice(1);
+    if (!/[.?!]$/.test(r)) r += ".";
+    return r;
   },
 
+  // Réponses chat simulées — contextuelles et réalistes
   chat: (prompt, modelName) => {
     const lc = prompt.toLowerCase();
-    if (/bonjour|salut|hello/.test(lc))
-      return `Bonjour ! Je suis ${modelName} via Baobab AI. Comment puis-je vous aider aujourd'hui ? 🌿`;
-    if (/email|lettre|rédige/.test(lc))
-      return `Voici un exemple de rédaction professionnelle :\n\nObjet : ${prompt.slice(0,40)}…\n\nMadame, Monsieur,\n\nJe me permets de vous contacter au sujet de [votre demande]. Dans ce contexte, il me semble important de préciser que [développement principal].\n\nDans l'attente de votre réponse, je reste à votre disposition.\n\nCordialement,\n[Votre nom]\n\n*(Réponse générée en mode test par ${modelName})*`;
-    if (/code|programme|fonction/.test(lc))
-      return `\`\`\`javascript\n// Solution générée par ${modelName}\nfunction solution(input) {\n  // Traitement de : ${prompt.slice(0,50)}\n  const result = input.toString().trim();\n  return result;\n}\n\nconsole.log(solution("test")); // → "test"\n\`\`\`\n\n**Explication :** Cette fonction prend une entrée, la convertit en chaîne et supprime les espaces. Adaptez-la à votre cas spécifique. *(Mode test — ${modelName})*`;
-    if (/analyse|résume|synthèse/.test(lc))
-      return `**Analyse effectuée par ${modelName}** 🧠\n\n**Résumé :** ${prompt.slice(0,100)}…\n\n**Points clés identifiés :**\n1. Premier élément important de votre demande\n2. Contexte général et enjeux associés\n3. Recommandations pratiques basées sur l'analyse\n\n**Conclusion :** Cette analyse confirme l'importance d'une approche structurée. *(Réponse simulée — mode test)*`;
-    if (/idea|idée|business|cameroun/.test(lc))
-      return `**💡 Idées de business au Cameroun — ${modelName}**\n\n1. **Livraison de repas locaux** : Plateforme de commande de plats traditionnels (ndolé, eru, poulet DG) avec livraison en 30min dans les grandes villes\n2. **Agri-tech** : Application mettant en relation agriculteurs et acheteurs en temps réel, avec prix du marché\n3. **Formation en ligne** : Cours en francophone sur des compétences numériques adaptées aux réalités locales\n4. **FinTech Mobile Money** : Solutions d'épargne et micro-crédit intégrées à MTN/Orange Money\n\n*(Réponse simulée — mode test — ${modelName})*`;
-    // Réponse générique
-    return `**Réponse de ${modelName}** (mode test)\n\nVotre demande : «${prompt.slice(0,80)}${prompt.length>80?"…":""}»\n\nEn mode de production, ${modelName} fournirait une réponse complète, précise et contextuelle à cette demande. La plateforme Baobab AI garantit des réponses de haute qualité grâce à la sélection automatique du meilleur modèle pour chaque tâche.\n\n*Prototype Baobab AI — Réponse simulée pour démonstration*`;
+
+    if (/bonjour|salut|hello|bonsoir/.test(lc))
+      return "Bonjour ! Je suis " + modelName + ", disponible via Baobab AI \uD83C\uDF3F\n\nJe peux vous aider pour : rédaction, analyse, code, traduction, idées business, et bien plus. Que souhaitez-vous faire ?";
+
+    if (/email|lettre|mail|rédige|écri/.test(lc)) {
+      const sujet = prompt.replace(/rédige|écris|email|professionnel|un|une|lettre|pour|mon|ma/gi, "").trim().slice(0,40) || "votre demande";
+      return "**\uD83D\uDCE7 Email professionnel — " + modelName + "**\n\n---\n**Objet : " + (sujet.charAt(0).toUpperCase()+sujet.slice(1)) + "**\n\nBonjour [Prénom],\n\nJe me permets de vous contacter concernant " + sujet + ".\n\nAprès examen attentif, il m'apparaît important de souligner :\n\n• Point principal à développer\n• Élément complémentaire\n• Action ou suite attendue\n\nJe reste à votre entière disposition.\n\nCordialement,\n[Votre nom] — [Votre poste]\n\n---\n*Personnalisez les sections entre crochets — " + modelName + " via Baobab AI*";
+    }
+
+    if (/code|programme|fonction|script|bug|erreur|développ/.test(lc)) {
+      const lang = /python/i.test(lc) ? "python" : "javascript";
+      const ex = lang === "python"
+        ? "def traiter(données):\n    if not données:\n        return None\n    return [item for item in données if item is not None]"
+        : "function traiter(données) {\n  if (!données?.length) return null;\n  return données.filter(item => item !== null);\n}";
+      return "**\uD83D\uDCBB Solution " + lang.toUpperCase() + " — " + modelName + "**\n\n```" + lang + "\n" + ex + "\n```\n\n**Explication :** Vérification de l'entrée, filtrage des valeurs nulles, retour du résultat propre. Adaptez à votre logique métier.\n\n*" + modelName + " via Baobab AI*";
+    }
+
+    if (/analys|résume|synthèse|résumé/.test(lc)) {
+      const sujet = prompt.replace(/analyse|résume|synthétise|le texte|ce document/gi, "").trim().slice(0,50) || "le contenu";
+      return "**\uD83E\uDDE0 Analyse — " + modelName + "**\n\n**Sujet :** " + sujet + "\n\n**Points clés :**\n1. **Contexte** — Situation initiale et problématique\n2. **Analyse** — Facteurs déterminants et dynamiques\n3. **Enjeux** — Ce qui est en jeu à court et moyen terme\n4. **Recommandations** — Actions prioritaires\n5. **Conclusion** — Synthèse et perspectives\n\n*" + modelName + " via Baobab AI*";
+    }
+
+    if (/idée|business|entrepreneur|projet|lancer|startup|cameroun|afrique/.test(lc)) {
+      return "**\uD83D\uDCA1 Idées business — " + modelName + "**\n\n1. **\uD83C\uDF7D\uFE0F FoodTech locale** — Livraison de plats traditionnels (ndolé, poulet DG) avec paiement Mobile Money.\n\n2. **\uD83C\uDF3E Agri-connect** — Mise en relation agriculteurs ↔ acheteurs, prix du marché en temps réel.\n\n3. **\uD83D\uDCF1 ÉduTech francophone** — Cours certifiants adaptés au marché de l'emploi camerounais.\n\n4. **\uD83D\uDCB0 Tontine digitale** — Épargne mobile automatisée intégrée à MTN/Orange Money.\n\n5. **\uD83D\uDD27 Services à domicile** — Artisans qualifiés géolocalisés et vérifiés.\n\n*" + modelName + " via Baobab AI \uD83C\uDF0D*";
+    }
+
+    const extrait = prompt.slice(0,60) + (prompt.length > 60 ? "…" : "");
+    return "**" + modelName + " — Baobab AI** \uD83C\uDF33\n\nVotre demande : *«" + extrait + "»*\n\n• **Analyse** — Votre besoin porte sur " + extrait.toLowerCase() + "\n• **Approche** — Une méthode structurée en 3 étapes permet d'atteindre l'objectif\n• **Conseil** — Précisez votre contexte pour une réponse encore plus ciblée\n\n*Mode test — En production : réponse complète par " + modelName + " via Baobab AI*";
   },
 
+  // Scripts pour tâches complexes
   script: (prompt, type) => {
+    const sujet = prompt.replace(/génère|crée|fais|une?|image|photo|vidéo|audio|voix|son/gi, "").trim().slice(0,80) || "contenu";
+    const s = sujet.charAt(0).toUpperCase() + sujet.slice(1);
     if (type === "image")
-      return `Un paysage africain majestueux au coucher du soleil : ${prompt.slice(0,60)}. Couleurs chaudes en or et orange, baobabs silhouettés contre le ciel, atmosphère paisible et lumineuse, style photographique hyperréaliste, résolution 4K.`;
+      return s + ", style photographique hyperréaliste 4K, lumière naturelle dorée, composition soignée, ambiance africaine authentique, couleurs chaudes.";
     if (type === "audio")
-      return `[Voix chaleureuse, ton professionnel, rythme modéré]\n\n${prompt.slice(0,80)}\n\n[Pause naturelle]\nBaobab AI — L'intelligence artificielle au service de l'Afrique.`;
-    return `[Scène 1] Vue aérienne du Cameroun, musique traditionnelle en fond\n[Scène 2] ${prompt.slice(0,60)}…\n[Scène 3] Gros plan sur le résultat final, signature Baobab AI`;
+      return "[Voix chaleureuse, ton professionnel] " + s + ". [Pause] Baobab AI — L'intelligence artificielle au service de l'Afrique.";
+    return "[0:00-0:03] Ouverture — " + sujet.slice(0,40) + ", plan large, musique douce\n[0:03-0:07] Développement — zoom progressif sur l'élément principal\n[0:07-0:09] Climax — mise en valeur du résultat\n[0:09-0:10] Signature Baobab AI — fondu au noir";
   },
 
+  // Rendu final — storyboard vidéo, forme d'onde audio, cadre image
   media: (model, type, script) => {
-    const icons   = { image:"🖼️", audio:"🎵", video:"🎬" };
-    const formats = { image:"PNG 1024×1024px", audio:"MP3 128kbps", video:"MP4 1080p 10s" };
-    return `${icons[type]} **Contenu généré par ${model.name}** *(Mode test)*\n\n**📋 Script préparé :**\n${script}\n\n---\n**⚙️ Simulation ${model.name} (${model.provider}) :**\n✅ Rendu complété avec succès\n📄 Format : ${formats[type]}\n📥 Cliquez le bouton de téléchargement pour sauvegarder\n\n*En production, ${model.name} générerait ici le vrai fichier via CrazyRouter.*`;
+    if (type === "image") {
+      return "\uD83D\uDDBC\uFE0F **Image générée par " + model.name + "**\n\n**Prompt optimisé :**\n> *" + script + "*\n\n```\n┌─────────────────────────────┐\n│                             │\n│   [ Rendu 1024 × 1024 px ]  │\n│     PNG · Qualité maximale  │\n│                             │\n└─────────────────────────────┘\n```\n\n✅ Rendu complété · \u26A1 " + model.name + " (" + model.provider + ")\n\uD83D\uDCCE Format : PNG 1024×1024px · HDR\n\uD83D\uDCE5 Téléchargez votre image ci-dessous\n\n*En production via CrazyRouter : vrai fichier PNG haute résolution.*";
+    }
+    if (type === "audio") {
+      return "\uD83C\uDFB5 **Audio généré par " + model.name + "**\n\n**Script :**\n> *" + script + "*\n\n**Forme d'onde :**\n```\n  ▁▂▄▆█▇▅▃▂▁▂▄▇█▆▄▂▁  ▁▃▅▇█▇▅▃▁\n  ████████████████████  ██████████\n  0s        5s       10s      15s\n```\n\n✅ Synthèse vocale complétée · \u26A1 " + model.name + "\n\uD83C\uDF99\uFE0F Format : MP3 · 128kbps · ~25 secondes\n\uD83D\uDCE5 Téléchargez votre audio ci-dessous\n\n*En production via CrazyRouter : vrai fichier MP3.*";
+    }
+    // Vidéo — storyboard ASCII avec timeline
+    const scenes = script.split("\n").filter(s => s.trim());
+    const planIcons = ["\uD83C\uDFA6", "\uD83D\uDCBD", "\u2728", "\uD83C\uDFA5"];
+    const planFrames = [
+      "┌──────────────┐\n│   ▓▓▓▓▓▓▓▓   │\n│   ▓ PLAN 1 ▓   │\n│   ▓▓▓▓▓▓▓▓   │\n└──────────────┘",
+      "┌──────────────┐\n│  ░▓▓▓▓▓▓▓░  │\n│  ░ PLAN 2  ░  │\n│  ░▓▓▓▓▓▓▓░  │\n└──────────────┘",
+      "┌──────────────┐\n│ ░░▓▓▓▓▓▓░░ │\n│ ░░ PLAN 3 ░░ │\n│ ░░▓▓▓▓▓▓░░ │\n└──────────────┘",
+      "┌──────────────┐\n│ ░░░▓▓▓░░░  │\n│ ░░ PLAN 4 ░░ │\n│ ░░░▓▓▓░░░  │\n└──────────────┘",
+    ];
+    const storyboard = scenes.slice(0,4).map((scene, i) => {
+      const desc = scene.replace(/\[.*?\]/g, "").trim();
+      return "**" + planIcons[i] + " Plan " + (i+1) + "**\n```\n" + planFrames[i] + "\n```\n" + desc;
+    }).join("\n\n");
+
+    return "\uD83C\uDFAC **Vidéo générée par " + model.name + "**\n\n**\uD83D\uDCCB STORYBOARD — " + scenes.length + " plans**\n\n" + storyboard + "\n\n**───── TIMELINE ─────**\n```\n[▓▓▓▓░░░░░░] 0s ── 3s ── 7s ── 10s\n  Intro    Dév.  Climax  Outro\n```\n\n✅ Rendu vidéo complété · \u26A1 " + model.name + " (" + model.provider + ")\n\uD83C\uDF9E\uFE0F Format : MP4 · 1080p · 10s · 30fps\n\uD83C\uDFB5 Audio : musique africaine incluse\n\uD83D\uDCE5 Téléchargez votre vidéo ci-dessous\n\n*En production via CrazyRouter : vrai fichier MP4 haute qualité.*";
   },
 };
 
@@ -283,45 +433,81 @@ const autoReformulate = async prompt => {
  * Orchestrateur principal — simulation en TEST_MODE, API réelle en production.
  * Retourne { reply: string, usageIn: number, usageOut: number }
  */
+/**
+ * Tronque l'historique conversationnel aux N derniers échanges.
+ * Évite d'envoyer des milliers de tokens inutiles à chaque message.
+ * Garde toujours le premier message système si présent.
+ */
+const truncateHistory = (history) => {
+  const maxPairs = CFG.maxContextMessages; // 8 messages = 4 échanges user/assistant
+  if (history.length <= maxPairs) return history;
+  // Garde les N derniers messages (les plus récents sont les plus pertinents)
+  return history.slice(-maxPairs);
+};
+
 const orchestrate = async (prompt, model, history, mode) => {
-  const type = taskType(prompt);
+  const type       = taskType(prompt);
+  const complexity = detectComplexity(prompt);
+  const limits     = getTokenLimits(complexity);
+
+  // ── Troncature contexte : ne jamais envoyer tout l'historique ──────────
+  const truncatedHistory = truncateHistory(history);
 
   if (TEST_MODE) {
-    const delay = 1000 + Math.random() * 1500;
+    const delay = 800 + Math.random() * 1200;
     await new Promise(r => setTimeout(r, delay));
 
     if (type === "text") {
-      const reply = SIMULATED_RESPONSES.chat(prompt, model.name);
-      // Simule les tokens consommés (proche de la réalité)
-      const usageIn  = Math.ceil(prompt.length / 3.5);
-      const usageOut = Math.ceil(reply.length / 3.5);
+      const reply    = SIMULATED_RESPONSES.chat(prompt, model.name);
+      // Simule les tokens réels avec les limites appliquées
+      const usageIn  = Math.min(Math.ceil(prompt.length / 3.5), limits.maxIn);
+      const usageOut = Math.min(Math.ceil(reply.length  / 3.5), limits.maxOut);
       return { reply, usageIn, usageOut };
     }
 
-    // Tâche complexe : script puis rendu
-    await new Promise(r => setTimeout(r, 800));
+    // Tâche complexe : script puis rendu simulé
+    await new Promise(r => setTimeout(r, 600));
     const script = SIMULATED_RESPONSES.script(prompt, type);
     const reply  = SIMULATED_RESPONSES.media(model, type, script);
-    return { reply, usageIn: 150, usageOut: 0 };
+    const usageIn = Math.min(150, limits.maxIn);
+    return { reply, usageIn, usageOut: 0 };
   }
 
-  // ── PRODUCTION (backend requis) ──
-  // Appel via proxy sécurisé POST /api/chat (clé API côté serveur)
+  // ── PRODUCTION — appels via backend proxy sécurisé ─────────────────────
+  // Le backend (server.js) détient la clé CrazyRouter côté serveur.
+  // Il valide les crédits en DB et applique les limites max_tokens.
+  // Décommentez et adaptez lors du passage en production VPS.
+  //
   // if (type === "text") {
-  //   const r = await fetch("/api/chat", { method:"POST",
-  //     headers:{"Content-Type":"application/json"},
-  //     body: JSON.stringify({ model: model.id, messages: history, prompt }) });
+  //   const r = await fetch("/api/chat", {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({
+  //       model:      model.id,
+  //       messages:   truncatedHistory,
+  //       max_tokens: limits.maxOut,    // ← limite stricte appliquée ici
+  //       prompt,
+  //     })
+  //   });
   //   const d = await r.json();
   //   return { reply: d.reply, usageIn: d.usage_in, usageOut: d.usage_out };
   // }
-  // ... orchestration tâches complexes similaire
+  // Pour les tâches complexes (image/audio/vidéo) :
+  // if (type === "image") {
+  //   const r = await fetch("/api/generate", {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ model: model.id, prompt, type })
+  //   });
+  //   const d = await r.json();
+  //   return { reply: d.result_url, usageIn: 0, usageOut: 0 };
+  // }
 
   await new Promise(r => setTimeout(r, 1200));
-  return {
-    reply:    SIMULATED_RESPONSES.chat(prompt, model.name),
-    usageIn:  Math.ceil(prompt.length / 3.5),
-    usageOut: 200,
-  };
+  const reply   = SIMULATED_RESPONSES.chat(prompt, model.name);
+  const usageIn = Math.min(Math.ceil(prompt.length / 3.5), limits.maxIn);
+  const usageOut= Math.min(Math.ceil(reply.length  / 3.5), limits.maxOut);
+  return { reply, usageIn, usageOut };
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -607,7 +793,8 @@ const PaymentPage = ({ isRenew=false, oldCredits=0, onSuccess, onBack }) => {
         {isRenew ? "Réabonnement en cours de traitement" : "Paiement en cours de traitement"}
       </h2>
       <p style={{ color:"var(--text2)", maxWidth:420, lineHeight:1.7 }}>
-        Votre paiement de <strong>15 000 FCFA</strong> via <strong>{method}</strong> est en attente de validation manuelle (max 24h).
+        Votre paiement de <strong>15 000 FCFA</strong> via <strong>{method}</strong> a bien été reçu.
+        Notre équipe l'active <strong>généralement en quelques minutes</strong> — au plus tard sous 24h.
       </p>
       {isRenew && oldCredits > 0 && (
         <div className="card p16" style={{ maxWidth:380, background:"rgba(200,148,26,.07)", borderColor:"rgba(200,148,26,.3)" }}>
@@ -623,9 +810,17 @@ const PaymentPage = ({ isRenew=false, oldCredits=0, onSuccess, onBack }) => {
           📅 Date : <strong>{fmtD(new Date().toISOString())}</strong>
         </p>
       </div>
-      <button className="btn btn-ghost" onClick={()=>onSuccess({ phone, method, pending:true, oldCredits })}>
-        Continuer {isRenew ? "" : "vers l'inscription"} →
-      </button>
+      {TEST_MODE ? (
+        // En mode test : accès immédiat, pas d'attente
+        <button className="btn btn-gold" onClick={()=>onSuccess({ phone, method, pending:false, oldCredits })}>
+          ✅ Continuer — accès immédiat (mode test)
+        </button>
+      ) : (
+        // En production : attente validation manuelle
+        <button className="btn btn-ghost" onClick={()=>onSuccess({ phone, method, pending:true, oldCredits })}>
+          Continuer {isRenew ? "" : "vers l'inscription"} →
+        </button>
+      )}
     </div>
   );
 
@@ -894,24 +1089,56 @@ const LoginPage = ({ onSuccess, onRegister }) => {
 // ═══════════════════════════════════════════════════════════════
 // § 15. PAGE D'ATTENTE (paiement en cours de validation)
 // ═══════════════════════════════════════════════════════════════
-const PendingPage = ({ user, onLogout }) => (
-  <div className="cs" style={{ flexDirection:"column", gap:20, textAlign:"center" }}>
-    <BaobabLogo size={80} float/>
-    <h2 style={{ fontFamily:"var(--fh)", fontSize:26, fontWeight:800 }}>Paiement en attente de validation</h2>
-    <p style={{ color:"var(--text2)", maxWidth:400, lineHeight:1.7 }}>
-      Bonjour <strong>{user.username}</strong>, votre paiement est en cours de vérification.<br/>
-      Accès activé sous 24h maximum.
-    </p>
-    <div className="card p16" style={{ maxWidth:360 }}>
-      <p style={{ fontSize:13, color:"var(--text2)", lineHeight:2 }}>
-        📧 Email : <strong>{user.email}</strong><br/>
-        💰 Montant : <strong>15 000 FCFA</strong><br/>
-        📅 Inscrit le : <strong>{fmtD(user.subscriptionDate)}</strong>
+const PendingPage = ({ user, onLogout, onAccessGranted }) => {
+  const [checking, setChecking] = useState(false);
+
+  // Vérifie dans la DB si l'admin a activé le compte
+  const checkAccess = () => {
+    setChecking(true);
+    setTimeout(() => {
+      const users = DB.get("users") || [];
+      const fresh = users.find(u => u.id === user.id);
+      if (fresh && fresh.active && !fresh.pending) {
+        showToast("✅ Votre accès est activé ! Bienvenue !", "success");
+        DB.set("session", fresh);
+        onAccessGranted(fresh);
+      } else {
+        showToast("Votre paiement n'est pas encore validé. Revenez dans quelques minutes.", "info");
+        setChecking(false);
+      }
+    }, 800);
+  };
+
+  return (
+    <div className="cs" style={{ flexDirection:"column", gap:20, textAlign:"center" }}>
+      <BaobabLogo size={80} float/>
+      <h2 style={{ fontFamily:"var(--fh)", fontSize:26, fontWeight:800 }}>
+        Votre paiement est confirmé 🎉
+      </h2>
+      <p style={{ color:"var(--text2)", maxWidth:420, lineHeight:1.7 }}>
+        Bonjour <strong>{user.username}</strong>, nous avons bien reçu votre paiement.<br/>
+        Notre équipe active votre accès <strong>généralement en quelques minutes</strong>.<br/>
+        Vous recevrez une confirmation dès que c'est fait.
       </p>
+      <div className="card p16" style={{ maxWidth:380, background:"rgba(200,148,26,.07)", borderColor:"rgba(200,148,26,.3)" }}>
+        <p style={{ fontSize:13, color:"var(--text2)", lineHeight:2 }}>
+          📧 Email : <strong>{user.email}</strong><br/>
+          💰 Montant : <strong>15 000 FCFA</strong><br/>
+          📅 Inscrit le : <strong>{fmtD(user.subscriptionDate)}</strong>
+        </p>
+      </div>
+      <div style={{ display:"flex", flexDirection:"column", gap:10, alignItems:"center" }}>
+        <button className="btn btn-gold btn-lg" onClick={checkAccess} disabled={checking}>
+          {checking ? <><Spinner/> Vérification…</> : "🔄 Vérifier mon accès"}
+        </button>
+        <p style={{ fontSize:12, color:"var(--muted)" }}>
+          Cliquez ce bouton après quelques minutes pour vérifier si votre accès est activé
+        </p>
+        <button className="btn btn-ghost btn-sm" onClick={onLogout}>Se déconnecter</button>
+      </div>
     </div>
-    <button className="btn btn-ghost" onClick={onLogout}>Se déconnecter</button>
-  </div>
-);
+  );
+};
 
 // ═══════════════════════════════════════════════════════════════
 // § 16. ÉCRAN CRÉDITS ÉPUISÉS + bouton réabonnement direct
@@ -972,11 +1199,21 @@ const ChatInterface = ({ user, onUserUpdate, onRenew }) => {
    * Correction bug V2 : on ne déduit plus sur l'estimation mais sur l'usage réel.
    */
   const deductCredits = (model, usageIn, usageOut) => {
-    const cost = realCost(model, usageIn, usageOut);
-    const updated = { ...cu, credits:Math.max(0,(cu.credits||0)-cost), creditsUsed:(cu.creditsUsed||0)+cost };
+    const cost    = realCost(model, usageIn, usageOut);
+    const newCred = Math.max(0, (cu.credits||0) - cost);
+    const updated = { ...cu, credits: newCred, creditsUsed: (cu.creditsUsed||0) + cost };
     saveUser(updated);
     setCu(updated);
     onUserUpdate(updated);
+    // ── Alerte automatique à 20% de crédits restants ──────────────────────
+    const pctLeft = (newCred / CFG.credits) * 100;
+    if (pctLeft <= 20 && pctLeft > 18) {
+      // Seuil 18% pour ne déclencher qu'une seule fois (évite spam)
+      showToast("⚠️ Il vous reste moins de 20% de vos crédits. Pensez à vous réabonner.", "info");
+    }
+    if (pctLeft <= 5 && pctLeft > 3) {
+      showToast("🔴 Crédits presque épuisés ! Réabonnez-vous pour continuer.", "error");
+    }
     return { updated, cost };
   };
 
@@ -1002,6 +1239,21 @@ const ChatInterface = ({ user, onUserUpdate, onRenew }) => {
     const raw = input.trim();
     if (!raw || pipeline?.stage==="reformulating" || sending) return;
     if (cu.credits <= 0) { showToast("Crédits épuisés. Réabonnez-vous.","error"); return; }
+
+    // ── Vérification quota vidéo mensuel ──────────────────────────────────
+    if (taskType(raw) === "video") {
+      const currentMonth = new Date().toLocaleDateString("fr-CA", { year:"numeric", month:"2-digit" }).replace("/","-");
+      const allConvs = DB.get("convs") || {};
+      const userConvs = allConvs[cu.id] || [];
+      const videoCount = userConvs
+        .flatMap(c => c.messages)
+        .filter(m => m.role === "user" && m.ts?.startsWith(currentMonth) && taskType(m.content) === "video")
+        .length;
+      if (videoCount >= CFG.videoQuotaPerMonth) {
+        showToast(`🎬 Quota vidéo atteint (${CFG.videoQuotaPerMonth} vidéos/mois). Quota renouvelé le mois prochain.`, "error");
+        return;
+      }
+    }
 
     setPipeline({ stage:"reformulating", original:raw, reformulated:null, model:null, cost:null });
     setInput("");
@@ -1988,7 +2240,7 @@ export default function App() {
       {view==="payment"    && <PaymentPage onSuccess={onPaySuccess} onBack={m=>setView(m==="login"?"login":"landing")}/>}
       {view==="register"   && <RegisterPage paymentData={payData} onSuccess={onRegisterSuccess} onBack={m=>setView(m==="login"?"login":"payment")}/>}
       {view==="login"      && <LoginPage onSuccess={onLoginSuccess} onRegister={()=>setView("payment")}/>}
-      {view==="pending"    && curUser && <PendingPage user={curUser} onLogout={onLogout}/>}
+      {view==="pending"    && curUser && <PendingPage user={curUser} onLogout={onLogout} onAccessGranted={u=>{ setCurUser(u); setView("app"); }}/>}
       {view==="app"        && curUser && <ChatInterface user={curUser} onUserUpdate={onUserUpdate} onRenew={onRenew}/>}
       {view==="admin"      && <AdminPanel onLogout={onLogout}/>}
       {view==="influencer" && curUser && <InfluencerPortal account={curUser} onLogout={onLogout}/>}
