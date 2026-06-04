@@ -40,7 +40,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
  * TEST_MODE = false → Appels API réels via backend proxy (production VPS).
  *                     Nécessite un serveur Express.js avec clé CrazyRouter.
  */
-const TEST_MODE = true;
+const TEST_MODE = false;
 
 const CFG = {
   price:        15_000,       // FCFA / mois
@@ -273,241 +273,71 @@ const taskType = prompt => {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// § 7. COUCHE IA — simulation en TEST_MODE, API réelle en prod
+// § 7. COUCHE IA — REQUÊTES API CORRIGÉES AVEC PASSE-DROIT NGROK
 // ═══════════════════════════════════════════════════════════════
 
 /**
- * Simulations réalistes pour TEST_MODE.
- * Chaque simulation imite le comportement attendu du modèle réel.
- */
-const SIMULATED_RESPONSES = {
-
-  // Reformulateur par règles locales — sans API, sans coût.
-  // Utilisé en TEST_MODE ET comme base en production.
-  // Transforme un prompt naturel en instruction directe optimisée.
-  reformulate: prompt => {
-    let r = prompt.trim();
-
-    // 1. Corrections orthographiques courantes (français camerounais)
-    const ortho = [
-      ["rezumé", "résumé"], ["resumé", "résumé"], ["analise", "analyse"],
-      ["besion", "besoin"], ["imporant", "important"], ["apication", "application"],
-      ["écrir", "écrire"], ["koi", "quoi"], ["pk ", "pourquoi "], ["qd ", "quand "],
-      ["ms ", "mais "], ["dc ", "donc "], ["pr ", "pour "], ["av ", "avec "],
-      ["tjs ", "toujours "], ["stp", ""], ["svp", ""], ["bcp", "beaucoup"],
-    ];
-    ortho.forEach(([old, rep]) => {
-      r = r.replace(new RegExp("\\b" + old + "\\b", "gi"), rep);
-    });
-
-    // 2. Supprimer les formules de politesse inutiles pour l'IA
-    r = r.replace(/^(bonjour|salut|hello|bonsoir|hey|coucou)[,!\.\s]*/i, "");
-    r = r.replace(/s'il (te|vous) pla[iî]t[,\.]?/gi, "");
-    r = r.replace(/merci (d'avance|beaucoup|bcp)?[,\.]?/gi, "");
-    r = r.replace(/(peux-?tu|pourrais-?tu|pourriez-?vous|est-?ce que tu peux?)/gi, "");
-    r = r.replace(/(aide-?moi [aà]|aide-?moi|aidez-?moi)/gi, "");
-    r = r.replace(/(j[e']?\s*(voudrais?|veux|souhaite|désire|aimerai[st])\s+)/gi, "");
-    r = r.replace(/(j['']ai besoin (que tu|de\s*))/gi, "");
-    r = r.replace(/(il faut que tu|j['']aimerais que tu)/gi, "");
-
-    // 3. Convertir en instruction directe (impératif)
-    r = r.replace(/^(rédiger|écrire)\s+/i, "Rédige ");
-    r = r.replace(/^(créer|faire|générer)\s+/i, "Crée ");
-    r = r.replace(/^(expliquer|comprendre)\s+/i, "Explique ");
-    r = r.replace(/^(analyser)\s+/i, "Analyse ");
-    r = r.replace(/^(traduire)\s+/i, "Traduis ");
-    r = r.replace(/^(résumer|faire un résumé de?)\s+/i, "Résume ");
-    r = r.replace(/^(corriger)\s+/i, "Corrige ");
-    r = r.replace(/^(lister|faire une liste de?)\s+/i, "Liste ");
-    r = r.replace(/^comment (faire|on fait) (pour )?/i, "Explique comment ");
-    r = r.replace(/^qu['']est-?ce (que?|qu[''])/i, "Explique ");
-    r = r.replace(/^c['']?est quoi\s+/i, "Définis ");
-    r = r.replace(/^(dis-?moi|explique-?moi|montre-?moi)\s+/i, "Explique ");
-
-    // 4. Ajout de précision contextuelle si manquante
-    if (/email|mail|courriel/i.test(r) && !/professionnel|formel|informel/i.test(r))
-      r = r.replace(/\b(email|mail|courriel)\b/gi, "email professionnel");
-    if (/résume|résumé/i.test(r) && !/concis|court|bref|point/i.test(r))
-      r = r.replace(/\.$/, "") + " en 5 points clés.";
-    if (/tradui/i.test(r) && !/vers |en (anglais|français|espagnol)/i.test(r))
-      r = r.replace(/\.$/, "") + " en anglais.";
-
-    // 5. Nettoyage final
-    r = r.replace(/\s+/g, " ").trim();
-    if (r.length < 8) r = prompt.trim();
-    r = r.charAt(0).toUpperCase() + r.slice(1);
-    if (!/[.?!]$/.test(r)) r += ".";
-    return r;
-  },
-
-  // Réponses chat simulées — contextuelles et réalistes
-  chat: (prompt, modelName) => {
-    const lc = prompt.toLowerCase();
-
-    if (/bonjour|salut|hello|bonsoir/.test(lc))
-      return "Bonjour ! Je suis " + modelName + ", disponible via Baobab AI \uD83C\uDF3F\n\nJe peux vous aider pour : rédaction, analyse, code, traduction, idées business, et bien plus. Que souhaitez-vous faire ?";
-
-    if (/email|lettre|mail|rédige|écri/.test(lc)) {
-      const sujet = prompt.replace(/rédige|écris|email|professionnel|un|une|lettre|pour|mon|ma/gi, "").trim().slice(0,40) || "votre demande";
-      return "**\uD83D\uDCE7 Email professionnel — " + modelName + "**\n\n---\n**Objet : " + (sujet.charAt(0).toUpperCase()+sujet.slice(1)) + "**\n\nBonjour [Prénom],\n\nJe me permets de vous contacter concernant " + sujet + ".\n\nAprès examen attentif, il m'apparaît important de souligner :\n\n• Point principal à développer\n• Élément complémentaire\n• Action ou suite attendue\n\nJe reste à votre entière disposition.\n\nCordialement,\n[Votre nom] — [Votre poste]\n\n---\n*Personnalisez les sections entre crochets — " + modelName + " via Baobab AI*";
-    }
-
-    if (/code|programme|fonction|script|bug|erreur|développ/.test(lc)) {
-      const lang = /python/i.test(lc) ? "python" : "javascript";
-      const ex = lang === "python"
-        ? "def traiter(données):\n    if not données:\n        return None\n    return [item for item in données if item is not None]"
-        : "function traiter(données) {\n  if (!données?.length) return null;\n  return données.filter(item => item !== null);\n}";
-      return "**\uD83D\uDCBB Solution " + lang.toUpperCase() + " — " + modelName + "**\n\n```" + lang + "\n" + ex + "\n```\n\n**Explication :** Vérification de l'entrée, filtrage des valeurs nulles, retour du résultat propre. Adaptez à votre logique métier.\n\n*" + modelName + " via Baobab AI*";
-    }
-
-    if (/analys|résume|synthèse|résumé/.test(lc)) {
-      const sujet = prompt.replace(/analyse|résume|synthétise|le texte|ce document/gi, "").trim().slice(0,50) || "le contenu";
-      return "**\uD83E\uDDE0 Analyse — " + modelName + "**\n\n**Sujet :** " + sujet + "\n\n**Points clés :**\n1. **Contexte** — Situation initiale et problématique\n2. **Analyse** — Facteurs déterminants et dynamiques\n3. **Enjeux** — Ce qui est en jeu à court et moyen terme\n4. **Recommandations** — Actions prioritaires\n5. **Conclusion** — Synthèse et perspectives\n\n*" + modelName + " via Baobab AI*";
-    }
-
-    if (/idée|business|entrepreneur|projet|lancer|startup|cameroun|afrique/.test(lc)) {
-      return "**\uD83D\uDCA1 Idées business — " + modelName + "**\n\n1. **\uD83C\uDF7D\uFE0F FoodTech locale** — Livraison de plats traditionnels (ndolé, poulet DG) avec paiement Mobile Money.\n\n2. **\uD83C\uDF3E Agri-connect** — Mise en relation agriculteurs ↔ acheteurs, prix du marché en temps réel.\n\n3. **\uD83D\uDCF1 ÉduTech francophone** — Cours certifiants adaptés au marché de l'emploi camerounais.\n\n4. **\uD83D\uDCB0 Tontine digitale** — Épargne mobile automatisée intégrée à MTN/Orange Money.\n\n5. **\uD83D\uDD27 Services à domicile** — Artisans qualifiés géolocalisés et vérifiés.\n\n*" + modelName + " via Baobab AI \uD83C\uDF0D*";
-    }
-
-    const extrait = prompt.slice(0,60) + (prompt.length > 60 ? "…" : "");
-    return "**" + modelName + " — Baobab AI** \uD83C\uDF33\n\nVotre demande : *«" + extrait + "»*\n\n• **Analyse** — Votre besoin porte sur " + extrait.toLowerCase() + "\n• **Approche** — Une méthode structurée en 3 étapes permet d'atteindre l'objectif\n• **Conseil** — Précisez votre contexte pour une réponse encore plus ciblée\n\n*Mode test — En production : réponse complète par " + modelName + " via Baobab AI*";
-  },
-
-  // Scripts pour tâches complexes
-  script: (prompt, type) => {
-    const sujet = prompt.replace(/génère|crée|fais|une?|image|photo|vidéo|audio|voix|son/gi, "").trim().slice(0,80) || "contenu";
-    const s = sujet.charAt(0).toUpperCase() + sujet.slice(1);
-    if (type === "image")
-      return s + ", style photographique hyperréaliste 4K, lumière naturelle dorée, composition soignée, ambiance africaine authentique, couleurs chaudes.";
-    if (type === "audio")
-      return "[Voix chaleureuse, ton professionnel] " + s + ". [Pause] Baobab AI — L'intelligence artificielle au service de l'Afrique.";
-    return "[0:00-0:03] Ouverture — " + sujet.slice(0,40) + ", plan large, musique douce\n[0:03-0:07] Développement — zoom progressif sur l'élément principal\n[0:07-0:09] Climax — mise en valeur du résultat\n[0:09-0:10] Signature Baobab AI — fondu au noir";
-  },
-
-  // Rendu final — storyboard vidéo, forme d'onde audio, cadre image
-  media: (model, type, script) => {
-    if (type === "image") {
-      return "\uD83D\uDDBC\uFE0F **Image générée par " + model.name + "**\n\n**Prompt optimisé :**\n> *" + script + "*\n\n```\n┌─────────────────────────────┐\n│                             │\n│   [ Rendu 1024 × 1024 px ]  │\n│     PNG · Qualité maximale  │\n│                             │\n└─────────────────────────────┘\n```\n\n✅ Rendu complété · \u26A1 " + model.name + " (" + model.provider + ")\n\uD83D\uDCCE Format : PNG 1024×1024px · HDR\n\uD83D\uDCE5 Téléchargez votre image ci-dessous\n\n*En production via CrazyRouter : vrai fichier PNG haute résolution.*";
-    }
-    if (type === "audio") {
-      return "\uD83C\uDFB5 **Audio généré par " + model.name + "**\n\n**Script :**\n> *" + script + "*\n\n**Forme d'onde :**\n```\n  ▁▂▄▆█▇▅▃▂▁▂▄▇█▆▄▂▁  ▁▃▅▇█▇▅▃▁\n  ████████████████████  ██████████\n  0s        5s       10s      15s\n```\n\n✅ Synthèse vocale complétée · \u26A1 " + model.name + "\n\uD83C\uDF99\uFE0F Format : MP3 · 128kbps · ~25 secondes\n\uD83D\uDCE5 Téléchargez votre audio ci-dessous\n\n*En production via CrazyRouter : vrai fichier MP3.*";
-    }
-    // Vidéo — storyboard ASCII avec timeline
-    const scenes = script.split("\n").filter(s => s.trim());
-    const planIcons = ["\uD83C\uDFA6", "\uD83D\uDCBD", "\u2728", "\uD83C\uDFA5"];
-    const planFrames = [
-      "┌──────────────┐\n│   ▓▓▓▓▓▓▓▓   │\n│   ▓ PLAN 1 ▓   │\n│   ▓▓▓▓▓▓▓▓   │\n└──────────────┘",
-      "┌──────────────┐\n│  ░▓▓▓▓▓▓▓░  │\n│  ░ PLAN 2  ░  │\n│  ░▓▓▓▓▓▓▓░  │\n└──────────────┘",
-      "┌──────────────┐\n│ ░░▓▓▓▓▓▓░░ │\n│ ░░ PLAN 3 ░░ │\n│ ░░▓▓▓▓▓▓░░ │\n└──────────────┘",
-      "┌──────────────┐\n│ ░░░▓▓▓░░░  │\n│ ░░ PLAN 4 ░░ │\n│ ░░░▓▓▓░░░  │\n└──────────────┘",
-    ];
-    const storyboard = scenes.slice(0,4).map((scene, i) => {
-      const desc = scene.replace(/\[.*?\]/g, "").trim();
-      return "**" + planIcons[i] + " Plan " + (i+1) + "**\n```\n" + planFrames[i] + "\n```\n" + desc;
-    }).join("\n\n");
-
-    return "\uD83C\uDFAC **Vidéo générée par " + model.name + "**\n\n**\uD83D\uDCCB STORYBOARD — " + scenes.length + " plans**\n\n" + storyboard + "\n\n**───── TIMELINE ─────**\n```\n[▓▓▓▓░░░░░░] 0s ── 3s ── 7s ── 10s\n  Intro    Dév.  Climax  Outro\n```\n\n✅ Rendu vidéo complété · \u26A1 " + model.name + " (" + model.provider + ")\n\uD83C\uDF9E\uFE0F Format : MP4 · 1080p · 10s · 30fps\n\uD83C\uDFB5 Audio : musique africaine incluse\n\uD83D\uDCE5 Téléchargez votre vidéo ci-dessous\n\n*En production via CrazyRouter : vrai fichier MP4 haute qualité.*";
-  },
-};
-
-/**
  * Reformule un prompt — simulation en TEST_MODE, API réelle en production.
- * Retourne { text: string }
  */
-const autoReformulate = async prompt => {
+const autoReformulate = async (prompt) => {
   if (TEST_MODE) {
-    await new Promise(r => setTimeout(r, 600 + Math.random() * 400));
     return { text: SIMULATED_RESPONSES.reformulate(prompt) };
   }
-  // PRODUCTION : appel via backend proxy sécurisé
-  // const r = await fetch("/api/reformulate", { method:"POST",
-  //   headers:{"Content-Type":"application/json"},
-  //   body: JSON.stringify({ prompt }) });
-  // const d = await r.json();
-  // return { text: d.result || prompt };
-  await new Promise(r => setTimeout(r, 600));
-  return { text: SIMULATED_RESPONSES.reformulate(prompt) };
+  
+  try {
+    // Si TEST_MODE = false, on appelle ton Lenovo x200
+    const apiUrl = localStorage.getItem("bb_NEXT_PUBLIC_API_URL") || "https://suffering-afraid-primary.ngrok-free.dev";
+    const response = await fetch(`${apiUrl}/api/ai/reformulate`, {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "true" // 🔓 LE LAISSEZ-PASSER NGROK
+      },
+      body: JSON.stringify({ prompt })
+    });
+    return await response.json();
+  } catch (err) {
+    console.error("Erreur reformulation:", err);
+    return { text: SIMULATED_RESPONSES.reformulate(prompt) };
+  }
 };
 
 /**
- * Orchestrateur principal — simulation en TEST_MODE, API réelle en production.
- * Retourne { reply: string, usageIn: number, usageOut: number }
+ * Orchestre l'appel API principal vers le backend ou la simulation
  */
-/**
- * Tronque l'historique conversationnel aux N derniers échanges.
- * Évite d'envoyer des milliers de tokens inutiles à chaque message.
- * Garde toujours le premier message système si présent.
- */
-const truncateHistory = (history) => {
-  const maxPairs = CFG.maxContextMessages; // 8 messages = 4 échanges user/assistant
-  if (history.length <= maxPairs) return history;
-  // Garde les N derniers messages (les plus récents sont les plus pertinents)
-  return history.slice(-maxPairs);
-};
-
-const orchestrate = async (prompt, model, history, mode) => {
-  const type       = taskType(prompt);
-  const complexity = detectComplexity(prompt);
-  const limits     = getTokenLimits(complexity);
-
-  // ── Troncature contexte : ne jamais envoyer tout l'historique ──────────
-  const truncatedHistory = truncateHistory(history);
+const orchestrate = async (prompt, modelId, mode, history = []) => {
+  const model = getMod(modelId);
+  const type = taskType(prompt);
 
   if (TEST_MODE) {
-    const delay = 800 + Math.random() * 1200;
-    await new Promise(r => setTimeout(r, delay));
-
-    if (type === "text") {
-      const reply    = SIMULATED_RESPONSES.chat(prompt, model.name);
-      // Simule les tokens réels avec les limites appliquées
-      const usageIn  = Math.min(Math.ceil(prompt.length / 3.5), limits.maxIn);
-      const usageOut = Math.min(Math.ceil(reply.length  / 3.5), limits.maxOut);
-      return { reply, usageIn, usageOut };
+    // Petit délai pour faire réaliste en mode test
+    await new Promise(r => setTimeout(r, 1000 + Math.random() * 1000));
+    
+    if (type !== "text") {
+      const script = SIMULATED_RESPONSES.script(prompt, type);
+      const mediaHtml = SIMULATED_RESPONSES.media(model, type, script);
+      return { text: mediaHtml, credits: model.ri };
     }
-
-    // Tâche complexe : script puis rendu simulé
-    await new Promise(r => setTimeout(r, 600));
-    const script = SIMULATED_RESPONSES.script(prompt, type);
-    const reply  = SIMULATED_RESPONSES.media(model, type, script);
-    const usageIn = Math.min(150, limits.maxIn);
-    return { reply, usageIn, usageOut: 0 };
+    
+    const reply = SIMULATED_RESPONSES.chat(prompt, model.name);
+    const credits = estCredits(prompt, model);
+    return { text: reply, credits };
   }
 
-  // ── PRODUCTION — appels via backend proxy sécurisé ─────────────────────
-  // Le backend (server.js) détient la clé CrazyRouter côté serveur.
-  // Il valide les crédits en DB et applique les limites max_tokens.
-  // Décommentez et adaptez lors du passage en production VPS.
-  //
-  // if (type === "text") {
-  //   const r = await fetch("/api/chat", {
-  //     method: "POST",
-  //     headers: { "Content-Type": "application/json" },
-  //     body: JSON.stringify({
-  //       model:      model.id,
-  //       messages:   truncatedHistory,
-  //       max_tokens: limits.maxOut,    // ← limite stricte appliquée ici
-  //       prompt,
-  //     })
-  //   });
-  //   const d = await r.json();
-  //   return { reply: d.reply, usageIn: d.usage_in, usageOut: d.usage_out };
-  // }
-  // Pour les tâches complexes (image/audio/vidéo) :
-  // if (type === "image") {
-  //   const r = await fetch("/api/generate", {
-  //     method: "POST",
-  //     headers: { "Content-Type": "application/json" },
-  //     body: JSON.stringify({ model: model.id, prompt, type })
-  //   });
-  //   const d = await r.json();
-  //   return { reply: d.result_url, usageIn: 0, usageOut: 0 };
-  // }
+  // ── MODE RÉEL : APPEL VERS TON LENOVO X200 ────────────────────────────
+  const apiUrl = localStorage.getItem("bb_NEXT_PUBLIC_API_URL") || "https://suffering-afraid-primary.ngrok-free.dev";
+  
+  const response = await fetch(`${apiUrl}/api/ai/chat`, {
+    method: "POST",
+    headers: { 
+      "Content-Type": "application/json",
+      "ngrok-skip-browser-warning": "true" // 🔓 LE LAISSEZ-PASSER NGROK
+    },
+    body: JSON.stringify({ prompt, modelId, mode, history })
+  });
 
-  await new Promise(r => setTimeout(r, 1200));
-  const reply   = SIMULATED_RESPONSES.chat(prompt, model.name);
-  const usageIn = Math.min(Math.ceil(prompt.length / 3.5), limits.maxIn);
-  const usageOut= Math.min(Math.ceil(reply.length  / 3.5), limits.maxOut);
-  return { reply, usageIn, usageOut };
+  if (!response.ok) throw new Error("Erreur serveur Baobab AI");
+  return await response.json();
 };
 
 // ═══════════════════════════════════════════════════════════════
